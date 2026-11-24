@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GameSir Tegenaria Mapper
+GenericName=Gamepad remapper
+Comment=Remapea y puentea el mando GameSir Tegenaria Lite (evdev/uinput)
+Exec=__BINDIR__/gamesir-rs
+Icon=gamesir-rs
+Terminal=false
+Categories=Game;Utility;
+Keywords=gamepad;mando;remap;gamesir;tegenaria;

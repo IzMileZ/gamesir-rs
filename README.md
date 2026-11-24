@@ -104,6 +104,22 @@ cargo run --release -- --write-default-profile ~/.config/gamesir-rs/prueba.toml
 | `-v`, `--verbose` | imprimir cada evento y su destino |
 | `-h`, `--help` | ayuda |
 
+### Instalación en el menú de aplicaciones
+
+```bash
+./install.sh              # compila y copia binario + ícono + .desktop en ~/.local
+./install.sh --no-build   # solo reinstala lo que ya hay en target/release
+```
+
+Copia `target/release/gamesir-rs` a `~/.local/bin/`, el ícono
+(`assets/gamesir-rs.svg`, el mismo mando verde de la bandeja) a
+`~/.local/share/icons/hicolor/scalable/apps/` y el lanzador
+«GameSir Tegenaria Mapper» (`assets/gamesir-rs.desktop`, `Terminal=false`,
+categorías `Game;Utility;`) a `~/.local/share/applications/`, refrescando la
+base de datos de `.desktop` y el caché de iconos si las herramientas existen.
+Con eso aparece en Rofi/Wofi/Fuzzel sin tocar la terminal; no se instala
+ningún autostart: se abre a mano cuando se va a usar el mando.
+
 Ctrl+C termina el puente o el daemon: el kernel cierra los descriptores al
 morir el proceso, así que el `grab()` y los dispositivos virtuales se liberan
 solos (comprobado). Con la ventana abierta y el puente activo, la X la oculta
@@ -237,6 +253,8 @@ src/tray.rs      bandeja StatusNotifierItem (ksni): ícono, menú y comandos
 src/input.rs     detección, grab(), dispositivos virtuales uinput, remapeo y bucle
 src/profile.rs   tipos del perfil, carga/guardado TOML y saneado de valores
 profiles/default.toml   perfil de prueba (embebido en el binario con include_str!)
+assets/          ícono SVG y lanzador .desktop instalados por install.sh
+install.sh       copia binario + ícono + .desktop en ~/.local (menú de aplicaciones)
 udev/99-gamesir.rules   regla opcional para equipos sin grupo input/uaccess
 tools/           bancos de pruebas con el hardware real (Python + python-evdev)
 ```
