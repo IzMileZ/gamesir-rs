@@ -3,6 +3,7 @@
 mod gui;
 mod input;
 mod profile;
+mod tray;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -16,6 +17,7 @@ gamesir-rs — puente de entrada para el GameSir Tegenaria Lite
 
 Uso:
   gamesir-rs                       abre la interfaz gráfica
+  gamesir-rs --daemon              segundo plano: puente activo sin ventana
   gamesir-rs --bridge              puente en la terminal, sin GUI
   gamesir-rs --list                lista los gamepads detectados y sale
   gamesir-rs --watch               vista en vivo de botones y ejes del físico
@@ -30,8 +32,11 @@ Opciones:
   -v, --verbose       imprimir cada evento traducido
   -h, --help          esta ayuda
 
-Sin --duration, Ctrl+C termina el proceso y el kernel libera el grab() y los
-dispositivos virtuales.
+Con bandeja del sistema (StatusNotifier/Waybar), el ícono permite mostrar u
+ocultar la ventana, activar o detener el puente, cambiar de perfil y salir.
+Con el puente activo, cerrar la ventana la oculta en la bandeja en vez de
+matar el proceso; «Salir» de la bandeja (o Ctrl+C en --daemon) cierra de
+verdad y el kernel libera el grab() y los dispositivos virtuales.
 ";
 
 #[derive(Default)]
@@ -39,6 +44,7 @@ struct Args {
     list: bool,
     watch: bool,
     bridge: bool,
+    daemon: bool,
     help: bool,
     verbose: bool,
     no_grab: bool,
@@ -58,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
             "--list" => args.list = true,
             "--watch" => args.watch = true,
             "-b" | "--bridge" => args.bridge = true,
+            "--daemon" | "--minimized" => args.daemon = true,
             "-v" | "--verbose" => args.verbose = true,
             "-n" | "--no-grab" => args.no_grab = true,
             "-d" | "--device" => args.device = Some(PathBuf::from(value("--device")?)),
@@ -112,20 +119,23 @@ fn print_stats(stats: &Stats) {
 }
 
 /// Modo pedido en la línea de comandos. Sin flags se abre la GUI; `--bridge`
-/// fuerza el puente en la terminal (útil para los bancos de pruebas de tools/).
+/// fuerza el puente en la terminal (útil para los bancos de pruebas de tools/)
+/// y `--daemon` lo deja en segundo plano con bandeja y sin ventana.
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Gui,
     List,
     Watch,
     Bridge,
+    Daemon,
 }
 
 fn mode_of(args: &Args) -> Mode {
-    match (args.list, args.watch, args.bridge) {
+    match (args.list, args.watch, args.bridge, args.daemon) {
         (true, ..) => Mode::List,
-        (_, true, _) => Mode::Watch,
-        (_, _, true) => Mode::Bridge,
+        (_, true, ..) => Mode::Watch,
+        (_, _, true, _) => Mode::Bridge,
+        (_, _, _, true) => Mode::Daemon,
         _ => Mode::Gui,
     }
 }
@@ -145,8 +155,8 @@ fn run(args: Args) -> Result<(), String> {
 
     let mode = mode_of(&args);
 
-    if mode == Mode::Gui {
-        return gui::run(profile, args.profile_path.clone());
+    if mode == Mode::Gui || mode == Mode::Daemon {
+        return gui::run(profile, args.profile_path.clone(), mode == Mode::Daemon);
     }
 
     if mode == Mode::List {

@@ -392,10 +392,16 @@ impl PhysicalPad {
             name,
             grabbed: false,
         };
-        // Sin dependencias de poll/epoll: se lee en no bloqueante y se duerme
-        // 1 ms cuando no hay eventos.
+        // Lectura no bloqueante: el bucle externo espera con epoll sobre este
+        // descriptor (ver `fd`) en vez de sondear con esperas de 1 ms.
         pad.device.set_nonblocking(true)?;
         Ok(pad)
+    }
+
+    /// Descriptor del nodo evdev, para registrarlo en un epoll.
+    pub fn fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.device.as_raw_fd()
     }
 
     /// Uso exclusivo del nodo: los juegos dejan de ver el mando original.
@@ -969,6 +975,20 @@ impl Bridge {
     /// Paso periódico del modo stick-a-ratón.
     pub fn tick(&mut self) -> io::Result<bool> {
         self.remapper.tick(&mut self.outputs)
+    }
+
+    /// Cierto si el stick-a-ratón está convirtiendo deflexión en movimiento
+    /// ahora mismo: el bucle externo acorta su espera para que sea fluido.
+    pub fn mouse_active(&self) -> bool {
+        let r = &self.remapper;
+        if !r.mouse_mode_active() {
+            return false;
+        }
+        let (x, y) = match r.profile.stick_to_mouse.stick {
+            Stick::Left => r.left_shaped,
+            Stick::Right => r.right_shaped,
+        };
+        x != 0.0 || y != 0.0
     }
 
     /// Aplica un perfil nuevo sin recrear los dispositivos virtuales. Solo es

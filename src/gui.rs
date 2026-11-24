@@ -1,14 +1,23 @@
-//! Interfaz gráfica (eframe/egui) y el hilo de trabajo que habla con el mando.
+//! Interfaz gráfica (eframe/egui), bandeja y el hilo de trabajo que habla con
+//! el mando.
 //!
-//! La GUI nunca toca el hardware: un hilo aparte abre el mando, lo lee y, si el
-//! puente está activo, lo traduce a los dispositivos virtuales. Se comunican con
-//! canales `std::sync::mpsc` (comandos hacia el hilo, eventos hacia la GUI) y el
-//! hilo pide repintados con `egui::Context::request_repaint`.
+//! Tres actores: un **hilo de entrada** que abre el mando, lo lee y traduce
+//! (espera con epoll en vez de sondear); un **controlador** en el hilo
+//! principal que funde los eventos del hilo en un modelo compartido, atiende
+//! la bandeja y gestiona el ciclo de vida de la ventana; y la **ventana**
+//! egui, que se crea y se destruye sin matar el proceso (en Wayland no se
+//! puede desmapear una ventana: ocultarla a la bandeja es cerrarla y volver a
+//! abrirla después). Los comandos viajan por un canal `mpsc` despertado con un
+//! `eventfd` para que el epoll del hilo de entrada los vea.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::io;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -16,6 +25,7 @@ use evdev::{AbsoluteAxisCode, EventType, InputEvent, KeyCode};
 
 use crate::input::{self, Bridge, Fetch, Outcome, PadInfo, PhysicalPad, Stats};
 use crate::profile::{Action, Bind, Profile, Stick};
+use crate::tray::{self, TrayCmd, TrayView};
 
 const VERDE: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
 const AMBAR: egui::Color32 = egui::Color32::from_rgb(210, 153, 34);
@@ -28,7 +38,9 @@ const DETECT_INTERVAL: Duration = Duration::from_millis(500);
 /// dispositivos virtuales (arrastrar un slider genera decenas de cambios).
 const RESTART_DEBOUNCE: Duration = Duration::from_millis(400);
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
-const POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Espera máxima del epoll con el stick-a-ratón emitiendo: el propio `tick()`
+/// del remapper agrupa el movimiento en pasos de 8 ms.
+const MOUSE_WAIT: Duration = Duration::from_millis(4);
 const EVENT_LOG_LEN: usize = 24;
 
 /// Botones que se pueden elegir como destino en el gamepad virtual.
@@ -132,6 +144,12 @@ const KEY_TARGETS: [KeyCode; 71] = [
     KeyCode::KEY_EQUAL,
 ];
 
+/// Cerrojo tolerante a pánicos: un hilo que muera dejando el cerrojo tomado
+/// no debe arrastrar al resto (la ventana y el controlador comparten modelo).
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------------
 // Hilo de trabajo
 // ---------------------------------------------------------------------------
@@ -145,14 +163,18 @@ pub enum WorkerMode {
     Monitor,
     /// Puente activo: `grab()` del físico y dispositivos virtuales emitiendo.
     Bridge,
+    /// El puente estaba pedido pero el mando se desconectó: en cuanto vuelva
+    /// a aparecer se reactiva solo.
+    Reconnect,
 }
 
 impl WorkerMode {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "inactivo",
             Self::Monitor => "monitorizando (sin capturar)",
             Self::Bridge => "puente activo (mando capturado)",
+            Self::Reconnect => "esperando reconexión (puente pedido)",
         }
     }
 }
@@ -185,9 +207,113 @@ enum State {
     Bridge(Box<Bridge>),
 }
 
+/// Contador `eventfd` que despierta al epoll del hilo de entrada cuando
+/// alguien envía un comando. Lo comparten todos los `CmdSender` y el hilo.
+struct WakeFd(RawFd);
+
+impl WakeFd {
+    fn new() -> io::Result<Self> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(fd))
+    }
+
+    fn ping(&self) {
+        let uno: u64 = 1;
+        unsafe {
+            libc::write(self.0, &uno as *const u64 as *const libc::c_void, 8);
+        }
+    }
+
+    fn drain(&self) {
+        let mut v: u64 = 0;
+        while unsafe { libc::read(self.0, &mut v as *mut u64 as *mut libc::c_void, 8) } == 8 {}
+    }
+}
+
+impl Drop for WakeFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+#[derive(Clone)]
+pub struct CmdSender {
+    tx: Sender<Command>,
+    wake: Arc<WakeFd>,
+}
+
+impl CmdSender {
+    pub fn send(&self, cmd: Command) {
+        let _ = self.tx.send(cmd);
+        self.wake.ping();
+    }
+}
+
+/// Espera simultánea del nodo evdev y del `eventfd` de comandos.
+struct Poller {
+    epfd: RawFd,
+    pad: Option<RawFd>,
+}
+
+impl Poller {
+    fn new(wake: RawFd) -> io::Result<Self> {
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if epfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let poller = Self { epfd, pad: None };
+        poller.ctl(libc::EPOLL_CTL_ADD, wake)?;
+        Ok(poller)
+    }
+
+    fn ctl(&self, op: i32, fd: RawFd) -> io::Result<()> {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: fd as u64,
+        };
+        if unsafe { libc::epoll_ctl(self.epfd, op, fd, &mut ev) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn set_pad(&mut self, fd: Option<RawFd>) {
+        if self.pad == fd {
+            return;
+        }
+        if let Some(old) = self.pad {
+            let _ = self.ctl(libc::EPOLL_CTL_DEL, old);
+        }
+        if let Some(new) = fd
+            && let Err(e) = self.ctl(libc::EPOLL_CTL_ADD, new)
+        {
+            eprintln!("[!] epoll: {e}");
+        }
+        self.pad = fd;
+    }
+
+    fn wait(&self, timeout: Duration) {
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut evs = [libc::epoll_event { events: 0, u64: 0 }; 2];
+        unsafe {
+            libc::epoll_wait(self.epfd, evs.as_mut_ptr(), evs.len() as i32, ms);
+        }
+    }
+}
+
+impl Drop for Poller {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.epfd) };
+    }
+}
+
 struct Worker {
-    ctx: egui::Context,
     cmds: Receiver<Command>,
+    wake: Arc<WakeFd>,
+    poller: Poller,
     out: Sender<Event>,
     state: State,
     profile: Profile,
@@ -197,13 +323,18 @@ struct Worker {
     last_detect: Instant,
     last_stats: Instant,
     stats: Stats,
+    /// El usuario quiere el puente activo, tenga o no mando delante ahora
+    /// mismo: es lo que permite reactivarlo al reconectar el cable.
+    bridge_intent: bool,
 }
 
 impl Worker {
-    fn new(ctx: egui::Context, cmds: Receiver<Command>, out: Sender<Event>) -> Self {
-        Self {
-            ctx,
+    fn new(cmds: Receiver<Command>, wake: Arc<WakeFd>, out: Sender<Event>) -> io::Result<Self> {
+        let poller = Poller::new(wake.0)?;
+        Ok(Self {
             cmds,
+            wake,
+            poller,
             out,
             state: State::Idle,
             profile: Profile::embedded_default(),
@@ -213,7 +344,8 @@ impl Worker {
             last_detect: Instant::now(),
             last_stats: Instant::now(),
             stats: Stats::default(),
-        }
+            bridge_intent: false,
+        })
     }
 
     fn run(&mut self) {
@@ -228,24 +360,30 @@ impl Worker {
         if !self.handle_commands() {
             return false;
         }
+        self.poller.wait(self.wait_timeout());
+        self.wake.drain();
+        if !self.handle_commands() {
+            return false;
+        }
 
         let mut state = std::mem::take(&mut self.state);
         let mut buf = std::mem::take(&mut self.buf);
         let mut disconnected = false;
         let mut fatal: Option<String> = None;
         let mut want_monitor = false;
+        let mut want_bridge = false;
 
         match &mut state {
             State::Idle => {
                 if self.last_detect.elapsed() >= DETECT_INTERVAL {
                     self.last_detect = Instant::now();
                     if input::detect_pad_info().is_some() {
-                        want_monitor = true;
-                    } else {
-                        thread::sleep(Duration::from_millis(20));
+                        if self.bridge_intent {
+                            want_bridge = true;
+                        } else {
+                            want_monitor = true;
+                        }
                     }
-                } else {
-                    thread::sleep(Duration::from_millis(20));
                 }
             }
             State::Monitor(pad) => match pad.fetch(&mut buf) {
@@ -253,9 +391,8 @@ impl Worker {
                     for ev in &buf {
                         self.report(ev);
                     }
-                    self.ctx.request_repaint();
                 }
-                Ok(Fetch::Idle) => thread::sleep(POLL_INTERVAL),
+                Ok(Fetch::Idle) => {}
                 Ok(Fetch::Disconnected) => disconnected = true,
                 Err(e) => fatal = Some(format!("lectura del mando: {e}")),
             },
@@ -274,9 +411,8 @@ impl Worker {
                                 Err(e) => fatal = Some(format!("emisión virtual: {e}")),
                             }
                         }
-                        self.ctx.request_repaint();
                     }
-                    Ok(Fetch::Idle) => thread::sleep(POLL_INTERVAL),
+                    Ok(Fetch::Idle) => {}
                     Ok(Fetch::Disconnected) => disconnected = true,
                     Err(e) => fatal = Some(format!("lectura del mando: {e}")),
                 }
@@ -301,22 +437,61 @@ impl Worker {
         }
         if disconnected {
             self.on_disconnected();
+        } else if want_bridge {
+            self.start_bridge();
         } else if want_monitor {
             self.start_monitor();
         }
         self.apply_pending();
+        self.sync_poller();
         true
+    }
+
+    /// Registra en el epoll el descriptor del mando abierto, si lo hay.
+    fn sync_poller(&mut self) {
+        let fd = match &self.state {
+            State::Idle => None,
+            State::Monitor(pad) => Some(pad.fd()),
+            State::Bridge(bridge) => Some(bridge.physical.fd()),
+        };
+        self.poller.set_pad(fd);
+    }
+
+    /// Hasta cuánto puede dormir el epoll sin perder puntualidad.
+    fn wait_timeout(&self) -> Duration {
+        let mut espera = match &self.state {
+            State::Idle => DETECT_INTERVAL.saturating_sub(self.last_detect.elapsed()),
+            State::Monitor(_) => STATS_INTERVAL,
+            State::Bridge(bridge) => {
+                let stats = STATS_INTERVAL.saturating_sub(self.last_stats.elapsed());
+                if bridge.mouse_active() {
+                    stats.min(MOUSE_WAIT)
+                } else {
+                    stats
+                }
+            }
+        };
+        if let Some((_, desde)) = self.pending {
+            espera = espera.min(RESTART_DEBOUNCE.saturating_sub(desde.elapsed()));
+        }
+        espera
     }
 
     fn handle_commands(&mut self) -> bool {
         loop {
             match self.cmds.try_recv() {
                 Ok(Command::Shutdown) => return false,
-                Ok(Command::StartBridge) => self.start_bridge(),
-                Ok(Command::StopBridge) => self.stop_bridge(),
+                Ok(Command::StartBridge) => {
+                    self.bridge_intent = true;
+                    self.start_bridge();
+                }
+                Ok(Command::StopBridge) => {
+                    self.bridge_intent = false;
+                    self.stop_bridge();
+                }
                 Ok(Command::UpdateProfile(profile)) => self.update_profile(profile),
                 Err(TryRecvError::Empty) => return true,
-                // La GUI ha desaparecido: no tiene sentido seguir.
+                // El controlador ha desaparecido: no tiene sentido seguir.
                 Err(TryRecvError::Disconnected) => return false,
             }
         }
@@ -326,7 +501,7 @@ impl Worker {
         let _ = self.out.send(ev);
     }
 
-    /// Reenvía a la GUI lo que llega del mando físico (antes de traducir).
+    /// Reenvía lo que llega del mando físico (antes de traducir).
     fn report(&self, ev: &InputEvent) {
         let type_ = ev.event_type();
         if type_ == EventType::KEY {
@@ -368,7 +543,8 @@ impl Worker {
                 "no se detectó ningún gamepad: conecta el mando e inténtalo otra vez".into(),
             ));
             self.emit(Event::Pad(None));
-            self.emit(Event::Mode(WorkerMode::Idle));
+            self.emit(Event::Nodes(String::new()));
+            self.emit(Event::Mode(self.intent_mode()));
             return;
         };
         let info = pad.info();
@@ -389,7 +565,13 @@ impl Worker {
             }
             Err(e) => {
                 self.emit(Event::Error(format!("no se pudo iniciar el puente: {e}")));
-                self.start_monitor();
+                if self.bridge_intent {
+                    // Se reintenta solo en cuanto el sondeo vuelva a ver el mando.
+                    self.last_detect = Instant::now();
+                    self.emit(Event::Mode(WorkerMode::Reconnect));
+                } else {
+                    self.start_monitor();
+                }
             }
         }
     }
@@ -403,10 +585,28 @@ impl Worker {
         self.start_monitor();
     }
 
+    fn intent_mode(&self) -> WorkerMode {
+        if self.bridge_intent {
+            WorkerMode::Reconnect
+        } else {
+            WorkerMode::Idle
+        }
+    }
+
     fn on_disconnected(&mut self) {
-        self.emit(Event::Log("el mando físico se desconectó".into()));
         self.state = State::Idle;
         self.last_detect = Instant::now();
+        self.emit(Event::Pad(None));
+        self.emit(Event::Nodes(String::new()));
+        if self.bridge_intent {
+            self.emit(Event::Mode(WorkerMode::Reconnect));
+            self.emit(Event::Log(
+                "el mando se desconectó; el puente se reactivará al reconectarlo".into(),
+            ));
+        } else {
+            self.emit(Event::Mode(WorkerMode::Idle));
+            self.emit(Event::Log("el mando físico se desconectó".into()));
+        }
     }
 
     fn update_profile(&mut self, profile: Profile) {
@@ -445,13 +645,21 @@ impl Worker {
 }
 
 // ---------------------------------------------------------------------------
-// Aplicación egui
+// Modelo compartido y aplicación egui
 // ---------------------------------------------------------------------------
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Monitor,
     Mapping,
+}
+
+/// Por qué se cerró la última ventana: para ocultarla a la bandeja o para
+/// terminar el proceso de verdad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    Hide,
+    Quit,
 }
 
 /// Tipos de destino de un bind, tal y como se ofrecen en la interfaz.
@@ -499,10 +707,9 @@ impl BindKind {
     }
 }
 
-pub struct GuiApp {
-    cmds: Sender<Command>,
-    rx: Receiver<Event>,
-    worker: Option<JoinHandle<()>>,
+/// Todo lo que sobrevive a un cierre de ventana: lo pintan las ventanas que
+/// se vayan abriendo y lo lee el controlador para la bandeja.
+pub struct GuiModel {
     tab: Tab,
     mode: WorkerMode,
     pad: Option<PadInfo>,
@@ -519,31 +726,26 @@ pub struct GuiApp {
     profile_path: Option<PathBuf>,
     available: Vec<PathBuf>,
     file_name: String,
+    /// Con el puente activo, la X oculta la ventana en la bandeja en vez de
+    /// matar el proceso.
+    hide_on_close: bool,
+    tray_ok: bool,
+    /// Hay una ventana egui abierta ahora mismo (lo fija el supervisor).
+    window_open: bool,
+    /// Pedidos pendientes del controlador a la ventana abierta.
+    hide_now: bool,
+    quit_now: bool,
+    close_reason: Option<CloseReason>,
 }
 
-impl GuiApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, profile: Profile, path: Option<PathBuf>) -> Self {
-        let (cmds_tx, cmds_rx) = channel();
-        let (ev_tx, ev_rx) = channel();
-        // El hilo arranca con el perfil que se muestra en la ventana, no con el
-        // embebido: se envía antes de lanzarlo para que lo vea en su primer bucle.
-        let _ = cmds_tx.send(Command::UpdateProfile(profile.clone()));
-        let ctx = cc.egui_ctx.clone();
-        let worker = thread::Builder::new()
-            .name("gamesir-input".into())
-            .spawn(move || Worker::new(ctx, cmds_rx, ev_tx).run())
-            .expect("no se pudo crear el hilo de entrada");
-
+impl GuiModel {
+    fn new(profile: Profile, path: Option<PathBuf>) -> Self {
         let file_name = path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| String::from("mi_perfil.toml"));
-
         Self {
-            cmds: cmds_tx,
-            rx: ev_rx,
-            worker: Some(worker),
             tab: Tab::Monitor,
             mode: WorkerMode::Idle,
             pad: None,
@@ -559,43 +761,12 @@ impl GuiApp {
             profile_path: path,
             available: list_profiles(&profiles_dir()),
             file_name,
-        }
-    }
-
-    fn send(&self, cmd: Command) {
-        let _ = self.cmds.send(cmd);
-    }
-
-    fn drain(&mut self) {
-        while let Ok(ev) = self.rx.try_recv() {
-            match ev {
-                Event::Mode(mode) => self.mode = mode,
-                Event::Pad(pad) => {
-                    self.pad = pad;
-                    self.buttons.clear();
-                    self.axes.clear();
-                }
-                Event::Nodes(nodes) => self.nodes = nodes,
-                Event::Log(msg) => self.log = msg,
-                Event::Error(msg) => {
-                    self.log = msg.clone();
-                    self.error = Some(msg);
-                }
-                Event::Button(code, value) => {
-                    self.buttons.insert(code, value);
-                    let nombre = format!("{:?}", KeyCode::new(code));
-                    let estado = match value {
-                        0 => "soltado",
-                        1 => "PULSADO",
-                        _ => "repetición",
-                    };
-                    self.push_event(format!("{nombre:<12} {estado}"));
-                }
-                Event::Axis(code, value) => {
-                    self.axes.insert(code, value);
-                }
-                Event::Stats(stats) => self.stats = Some(stats),
-            }
+            hide_on_close: true,
+            tray_ok: false,
+            window_open: false,
+            hide_now: false,
+            quit_now: false,
+            close_reason: None,
         }
     }
 
@@ -606,14 +777,34 @@ impl GuiApp {
         }
     }
 
-    fn push_profile(&mut self) {
+    fn push_profile(&mut self, cmds: &CmdSender) {
         self.sent = self.profile.clone();
-        self.send(Command::UpdateProfile(self.profile.clone()));
+        cmds.send(Command::UpdateProfile(self.profile.clone()));
+    }
+
+    fn paint(&mut self, ui: &mut egui::Ui, cmds: &CmdSender) {
+        self.top_bar(ui, cmds);
+        self.tab_bar(ui);
+        self.status_bar(ui);
+
+        let tab = self.tab;
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match tab {
+                    Tab::Monitor => self.monitor_tab(ui),
+                    Tab::Mapping => self.mapping_tab(ui),
+                });
+        });
+
+        if self.profile != self.sent {
+            self.push_profile(cmds);
+        }
     }
 
     // -- barra superior -----------------------------------------------------
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    fn top_bar(&mut self, ui: &mut egui::Ui, cmds: &CmdSender) {
         egui::Panel::top("barra_superior").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -627,6 +818,14 @@ impl GuiApp {
                     (Some(pad), WorkerMode::Idle) => {
                         (AMBAR, format!("{} — conectado, en espera", pad.short()))
                     }
+                    (_, WorkerMode::Reconnect) => (
+                        AMBAR,
+                        match &self.pad {
+                            Some(pad) => format!("{} — reconectando…", pad.short()),
+                            None => "mando desconectado: el puente se reactivará al reconectar"
+                                .to_string(),
+                        },
+                    ),
                     (None, _) => (ROJO, "GameSir Tegenaria Lite no detectado".to_string()),
                 };
                 ui.colored_label(color, egui::RichText::new("●").size(15.0));
@@ -646,15 +845,27 @@ impl GuiApp {
             ui.horizontal(|ui| {
                 self.profile_controls(ui);
                 ui.separator();
-                self.bridge_button(ui);
+                self.bridge_button(ui, cmds);
+                ui.separator();
+                ui.add_enabled(
+                    self.tray_ok,
+                    egui::Checkbox::new(&mut self.hide_on_close, "Ocultar al cerrar"),
+                )
+                .on_disabled_hover_text(
+                    "Sin bandeja del sistema disponible, cerrar la ventana termina el proceso",
+                )
+                .on_hover_text(
+                    "Con el puente activo, cerrar la ventana la oculta en la bandeja \n\
+                     en vez de terminar el proceso (el «Salir» de la bandeja sí cierra)",
+                );
             });
             ui.add_space(6.0);
         });
     }
 
-    fn bridge_button(&mut self, ui: &mut egui::Ui) {
-        let activo = self.mode == WorkerMode::Bridge;
-        let texto = if activo {
+    fn bridge_button(&mut self, ui: &mut egui::Ui, cmds: &CmdSender) {
+        let pedido = matches!(self.mode, WorkerMode::Bridge | WorkerMode::Reconnect);
+        let texto = if pedido {
             "■  Detener puente"
         } else {
             "▶  Activar puente"
@@ -665,17 +876,17 @@ impl GuiApp {
                 .size(15.0)
                 .color(egui::Color32::WHITE),
         )
-        .fill(if activo { ROJO } else { VERDE })
+        .fill(if pedido { ROJO } else { VERDE })
         .min_size(egui::vec2(210.0, 30.0));
         let respuesta = ui
-            .add_enabled(activo || self.pad.is_some(), boton)
+            .add_enabled(pedido || self.pad.is_some(), boton)
             .on_disabled_hover_text("Conecta el mando para poder activar el puente");
         if respuesta.clicked() {
-            if activo {
-                self.send(Command::StopBridge);
+            if pedido {
+                cmds.send(Command::StopBridge);
             } else {
-                self.push_profile();
-                self.send(Command::StartBridge);
+                self.push_profile(cmds);
+                cmds.send(Command::StartBridge);
             }
         }
     }
@@ -1199,37 +1410,325 @@ impl GuiApp {
     }
 }
 
-impl Drop for GuiApp {
-    fn drop(&mut self) {
-        self.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+pub struct GuiApp {
+    model: Arc<Mutex<GuiModel>>,
+    cmds: CmdSender,
+}
+
+impl GuiApp {
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        model: Arc<Mutex<GuiModel>>,
+        cmds: CmdSender,
+    ) -> Self {
+        Self { model, cmds }
     }
 }
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain();
-        self.top_bar(ui);
-        self.tab_bar(ui);
-        self.status_bar(ui);
+        let mut m = lock(&self.model);
+        m.paint(ui, &self.cmds);
 
-        let tab = self.tab;
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| match tab {
-                    Tab::Monitor => self.monitor_tab(ui),
-                    Tab::Mapping => self.mapping_tab(ui),
-                });
-        });
-
-        if self.profile != self.sent {
-            self.push_profile();
+        let ctx = ui.ctx().clone();
+        let cerrado = ctx.input(|i| i.viewport().close_requested());
+        if m.quit_now {
+            m.quit_now = false;
+            m.close_reason = Some(CloseReason::Quit);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if m.hide_now {
+            m.hide_now = false;
+            m.close_reason = Some(CloseReason::Hide);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if cerrado {
+            // En Wayland una ventana no se puede desmapear (el `set_visible`
+            // de winit no hace nada): ocultar a la bandeja es cerrar la
+            // ventana sin matar el proceso, y «Mostrar» la vuelve a abrir.
+            m.close_reason = if m.tray_ok
+                && m.hide_on_close
+                && matches!(m.mode, WorkerMode::Bridge | WorkerMode::Reconnect)
+            {
+                Some(CloseReason::Hide)
+            } else {
+                Some(CloseReason::Quit)
+            };
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Controlador: funde eventos, atiende la bandeja y gestiona la ventana
+// ---------------------------------------------------------------------------
+
+/// Órdenes del controlador al supervisor de ventana (hilo principal).
+pub enum WindowCmd {
+    Show,
+    Quit,
+}
+
+struct Controller {
+    model: Arc<Mutex<GuiModel>>,
+    cmds: CmdSender,
+    ev_rx: Receiver<Event>,
+    stop: Arc<AtomicBool>,
+    tray: Option<ksni::blocking::Handle<tray::GamesirTray>>,
+    tray_view: Arc<Mutex<TrayView>>,
+    tray_rx: Receiver<TrayCmd>,
+    win_tx: Sender<WindowCmd>,
+    snap: Option<TrayView>,
+    quit: bool,
+}
+
+impl Controller {
+    fn bucle(&mut self) {
+        while !self.quit && !self.stop.load(Ordering::Relaxed) {
+            if let Ok(ev) = self.ev_rx.recv_timeout(Duration::from_millis(100)) {
+                self.merge(ev);
+            }
+            while let Ok(ev) = self.ev_rx.try_recv() {
+                self.merge(ev);
+            }
+            while let Ok(cmd) = self.tray_rx.try_recv() {
+                self.tray_cmd(cmd);
+            }
+            if !self.quit {
+                self.push_tray();
+            }
+        }
+        if let Some(tray) = &self.tray {
+            tray.shutdown().wait();
+        }
+    }
+
+    /// Funde un evento del hilo de entrada en el modelo compartido.
+    fn merge(&mut self, ev: Event) {
+        let mut m = lock(&self.model);
+        match ev {
+            Event::Mode(mode) => m.mode = mode,
+            Event::Pad(pad) => {
+                m.pad = pad;
+                m.buttons.clear();
+                m.axes.clear();
+            }
+            Event::Nodes(nodes) => m.nodes = nodes,
+            Event::Log(msg) => m.log = msg,
+            Event::Error(msg) => {
+                m.log = msg.clone();
+                m.error = Some(msg);
+            }
+            Event::Button(code, value) => {
+                m.buttons.insert(code, value);
+                let nombre = format!("{:?}", KeyCode::new(code));
+                let estado = match value {
+                    0 => "soltado",
+                    1 => "PULSADO",
+                    _ => "repetición",
+                };
+                m.push_event(format!("{nombre:<12} {estado}"));
+            }
+            Event::Axis(code, value) => {
+                m.axes.insert(code, value);
+            }
+            Event::Stats(stats) => m.stats = Some(stats),
+        }
+    }
+
+    fn tray_cmd(&mut self, cmd: TrayCmd) {
+        match cmd {
+            TrayCmd::ToggleWindow => {
+                let abierta = lock(&self.model).window_open;
+                if abierta {
+                    lock(&self.model).hide_now = true;
+                } else {
+                    let _ = self.win_tx.send(WindowCmd::Show);
+                }
+            }
+            TrayCmd::SetBridge(true) => {
+                let perfil = lock(&self.model).profile.clone();
+                self.cmds.send(Command::UpdateProfile(perfil));
+                self.cmds.send(Command::StartBridge);
+            }
+            TrayCmd::SetBridge(false) => self.cmds.send(Command::StopBridge),
+            TrayCmd::LoadProfile(path) => self.load_profile(path),
+            TrayCmd::Quit => {
+                lock(&self.model).quit_now = true;
+                let _ = self.win_tx.send(WindowCmd::Quit);
+                self.quit = true;
+            }
+        }
+    }
+
+    fn load_profile(&mut self, path: Option<PathBuf>) {
+        let mut m = lock(&self.model);
+        match &path {
+            None => {
+                m.profile = Profile::embedded_default();
+                m.profile_path = None;
+                m.log = "perfil embebido de prueba cargado".into();
+            }
+            Some(ruta) => match Profile::load(ruta) {
+                Ok(perfil) => {
+                    m.profile = perfil;
+                    m.profile_path = Some(ruta.clone());
+                    m.error = None;
+                    m.log = format!("perfil cargado: {}", ruta.display());
+                }
+                Err(e) => {
+                    m.error = Some(format!("{}: {e}", ruta.display()));
+                    return;
+                }
+            },
+        }
+        m.available = list_profiles(&profiles_dir());
+        m.sent = m.profile.clone();
+        self.cmds.send(Command::UpdateProfile(m.profile.clone()));
+    }
+
+    /// Vuelca el estado relevante a la bandeja y emite las señales de cambio
+    /// solo si algo difiere del último volcado.
+    fn push_tray(&mut self) {
+        let vista = {
+            let m = lock(&self.model);
+            TrayView {
+                mode: m.mode,
+                pad: m.pad.as_ref().map(|p| p.short()),
+                window_open: m.window_open,
+                profiles: perfiles_menu(&m),
+                active: m.profile_path.clone(),
+            }
+        };
+        if self.snap.as_ref() == Some(&vista) {
+            return;
+        }
+        *lock(&self.tray_view) = vista.clone();
+        if let Some(tray) = &self.tray {
+            tray.update(|_| {});
+        }
+        self.snap = Some(vista);
+    }
+}
+
+fn perfiles_menu(m: &GuiModel) -> Vec<(String, Option<PathBuf>)> {
+    let mut lista = vec![(embedded_label(), None)];
+    for path in &m.available {
+        let nombre = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        lista.push((nombre, Some(path.clone())));
+    }
+    lista
+}
+
+fn embedded_label() -> String {
+    static NOMBRE: OnceLock<String> = OnceLock::new();
+    NOMBRE
+        .get_or_init(|| format!("{} (embebido)", Profile::embedded_default().name))
+        .clone()
+}
+
+/// Arranca el hilo de entrada, la bandeja y el controlador, y supervisa la
+/// ventana desde el hilo principal. Bloquea hasta que se pide salir.
+pub fn run(profile: Profile, path: Option<PathBuf>, daemon: bool) -> Result<(), String> {
+    let (cmd_tx, cmd_rx) = channel();
+    let wake = Arc::new(WakeFd::new().map_err(|e| format!("eventfd: {e}"))?);
+    let cmds = CmdSender {
+        tx: cmd_tx,
+        wake: wake.clone(),
+    };
+    let (ev_tx, ev_rx) = channel();
+    let model = Arc::new(Mutex::new(GuiModel::new(profile.clone(), path)));
+    // El hilo arranca con el perfil inicial antes de su primer bucle.
+    cmds.send(Command::UpdateProfile(profile));
+
+    let worker = thread::Builder::new()
+        .name("gamesir-input".into())
+        .spawn(move || match Worker::new(cmd_rx, wake, ev_tx) {
+            Ok(mut worker) => worker.run(),
+            Err(e) => eprintln!("[!] hilo de entrada: {e}"),
+        })
+        .expect("no se pudo crear el hilo de entrada");
+
+    let (tray_tx, tray_rx) = channel();
+    let tray_view = Arc::new(Mutex::new(TrayView::default()));
+    let tray = match tray::iniciar(tray_view.clone(), tray_tx) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            eprintln!("[!] {e}; seguirá funcionando sin bandeja");
+            None
+        }
+    };
+    lock(&model).tray_ok = tray.is_some();
+
+    let (win_tx, win_rx) = channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut ctl = Controller {
+        model: model.clone(),
+        cmds: cmds.clone(),
+        ev_rx,
+        stop: stop.clone(),
+        tray,
+        tray_view,
+        tray_rx,
+        win_tx,
+        snap: None,
+        quit: false,
+    };
+    let controller = thread::Builder::new()
+        .name("gamesir-control".into())
+        .spawn(move || ctl.bucle())
+        .expect("no se pudo crear el hilo controlador");
+
+    if daemon {
+        // Segundo plano: puente activo desde el principio y sin ventana.
+        cmds.send(Command::StartBridge);
+    }
+
+    // Supervisor de ventana: winit solo permite el bucle de eventos en el
+    // hilo principal, y en Wayland una ventana no se puede desmapear, así
+    // que ocultar/mostrar es cerrar y volver a abrir (`run_native` otra vez).
+    let mut abierta = !daemon;
+    loop {
+        if abierta {
+            lock(&model).window_open = true;
+            let options = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([1000.0, 700.0])
+                    .with_min_inner_size([820.0, 560.0]),
+                ..Default::default()
+            };
+            let app_model = model.clone();
+            let app_cmds = cmds.clone();
+            let _ = eframe::run_native(
+                "gamesir-rs — Tegenaria Lite",
+                options,
+                Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, app_model, app_cmds)))),
+            );
+            let mut m = lock(&model);
+            m.window_open = false;
+            if m.close_reason.take() != Some(CloseReason::Hide) {
+                break;
+            }
+        }
+        // Oculta (o arrancada en --daemon): espera la próxima orden.
+        match win_rx.recv() {
+            Ok(WindowCmd::Show) => {
+                let mut m = lock(&model);
+                m.close_reason = None;
+                m.hide_now = false;
+                m.quit_now = false;
+            }
+            Ok(WindowCmd::Quit) | Err(_) => break,
+        }
+        abierta = true;
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = controller.join();
+    cmds.send(Command::Shutdown);
+    let _ = worker.join();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,20 +1869,4 @@ fn list_profiles(dir: &Path) -> Vec<PathBuf> {
     };
     paths.sort();
     paths
-}
-
-/// Abre la ventana principal. Bloquea hasta que se cierra.
-pub fn run(profile: Profile, path: Option<PathBuf>) -> Result<(), String> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([820.0, 560.0]),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "gamesir-rs — Tegenaria Lite",
-        options,
-        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, profile, path)))),
-    )
-    .map_err(|e| format!("no se pudo abrir la ventana: {e}"))
 }
