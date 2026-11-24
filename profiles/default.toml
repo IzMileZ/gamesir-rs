@@ -1,0 +1,57 @@
+# Perfil de prueba del GameSir Tegenaria Lite (VID:PID 3537:1093).
+# Botones y ejes se escriben con su nombre de <linux/input-event-codes.h>.
+
+name = "Prueba Tegenaria"
+
+# Los botones del mando ya usan la convención BTN_SOUTH/BTN_EAST/... (lo que
+# evdev de Python llamaba BTN_A/BTN_B son alias del mismo código), así que se
+# reenvían tal cual. La traducción de verdad ocurre en los ejes: el stick
+# derecho viaja en ABS_Z/ABS_RZ y los gatillos en ABS_BRAKE/ABS_GAS, todo en
+# 8 bits; el gamepad virtual los expone como ABS_RX/ABS_RY y ABS_Z/ABS_RZ en
+# 16 bits. Cada [[bind]] tiene prioridad sobre ese comportamiento.
+
+# Identidad explícita: sirve para comprobar que el bind gana al reenvío.
+[[bind]]
+from = "BTN_SOUTH"
+to = { pad = "BTN_SOUTH" }
+
+# Botón trasero BTN_C -> se conserva en el gamepad virtual (el dispositivo
+# virtual declara los códigos que use el perfil).
+[[bind]]
+from = "BTN_C"
+to = { pad = "BTN_C" }
+
+# Botón de gamepad -> tecla del teclado virtual.
+[[bind]]
+from = "BTN_NORTH"
+to = { key = "KEY_SPACE" }
+
+# Botón de gamepad -> clic del ratón virtual.
+[[bind]]
+from = "BTN_WEST"
+to = { mouse = "BTN_LEFT" }
+
+# BTN_Z (botón trasero aún sin identificar): se descarta para que no llegue
+# a ningún juego mientras no sepamos qué es.
+[[bind]]
+from = "BTN_Z"
+to = "ignore"
+
+[left_stick]
+deadzone = 0.08
+sensitivity = 1.0
+
+[right_stick]
+deadzone = 0.10
+sensitivity = 1.0
+
+[triggers]
+hair_trigger = true
+threshold = 0.12
+
+[stick_to_mouse]
+enabled = false
+stick = "right"
+hold = "BTN_SELECT"
+speed = 900.0
+suppress_axis = true

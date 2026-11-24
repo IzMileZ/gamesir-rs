@@ -1,0 +1,19 @@
+# GameSir Tegenaria Lite — acceso sin root para gamesir-rs
+#
+# En esta máquina NO hace falta instalarla: el usuario ya pertenece al grupo
+# `input` y /dev/uinput tiene ACL uaccess de systemd-logind. El archivo existe
+# para otros equipos/usuarios donde eso no se cumpla.
+#
+# Instalación (requiere root):
+#   sudo cp udev/99-gamesir.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Comprobación:
+#   ls -l /dev/uinput /dev/input/by-id/usb-3537_GameSir-Tegenaria_Lite*
+
+# Nodos del mando (gamepad, teclado y ratón comparten VID:PID).
+SUBSYSTEM=="input", ATTRS{idVendor}=="3537", ATTRS{idProduct}=="1093", MODE="0660", GROUP="input", TAG+="uaccess"
+
+# Dispositivos virtuales: sin esto, crear el gamepad/teclado/ratón virtuales
+# exige root.
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
