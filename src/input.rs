@@ -178,7 +178,7 @@ pub struct PadCandidate {
     pub name: String,
     pub vendor: u16,
     pub product: u16,
-    pub buttons: usize,
+    pub keys: Vec<KeyCode>,
     pub axes: Vec<(AbsoluteAxisCode, AbsInfo)>,
     device: Device,
 }
@@ -195,11 +195,73 @@ impl PadCandidate {
         if NAME_HINTS.iter().any(|hint| name.contains(hint)) {
             s += 2;
         }
-        if self.buttons > 0 && !self.axes.is_empty() {
+        if !self.keys.is_empty() && !self.axes.is_empty() {
             s += 1;
         }
         s
     }
+
+    /// Instantánea clonable con lo que necesita la interfaz gráfica.
+    pub fn info(&self) -> PadInfo {
+        PadInfo {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            vendor: self.vendor,
+            product: self.product,
+            keys: self.keys.clone(),
+            axes: self
+                .axes
+                .iter()
+                .map(|(code, ai)| AxisRange {
+                    code: *code,
+                    min: ai.minimum(),
+                    max: ai.maximum(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Rango declarado por un eje del mando físico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxisRange {
+    pub code: AbsoluteAxisCode,
+    pub min: i32,
+    pub max: i32,
+}
+
+impl AxisRange {
+    pub fn absinfo(&self) -> AbsInfo {
+        AbsInfo::new(0, self.min, self.max, 0, 0, 0)
+    }
+}
+
+/// Descripción clonable de un mando, para mostrarla en la GUI o en logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadInfo {
+    pub name: String,
+    pub path: PathBuf,
+    pub vendor: u16,
+    pub product: u16,
+    pub keys: Vec<KeyCode>,
+    pub axes: Vec<AxisRange>,
+}
+
+impl PadInfo {
+    pub fn axis(&self, code: AbsoluteAxisCode) -> Option<AxisRange> {
+        self.axes.iter().find(|a| a.code == code).copied()
+    }
+
+    /// Nombre y ruta, para la barra de estado.
+    pub fn short(&self) -> String {
+        format!("{} ({})", self.name, self.path.display())
+    }
+}
+
+fn supported_keys(dev: &Device) -> Vec<KeyCode> {
+    dev.supported_keys()
+        .map(|keys| keys.iter().collect())
+        .unwrap_or_default()
 }
 
 fn has_pad_caps(dev: &Device) -> bool {
@@ -222,10 +284,7 @@ pub fn find_pads() -> Vec<PadCandidate> {
         }
         let id = device.input_id();
         let name = device.name().unwrap_or("desconocido").to_string();
-        let buttons = device
-            .supported_keys()
-            .map(|keys| keys.iter().count())
-            .unwrap_or(0);
+        let keys = supported_keys(&device);
         let axes = device
             .get_absinfo()
             .map(|it| it.collect())
@@ -235,7 +294,7 @@ pub fn find_pads() -> Vec<PadCandidate> {
             name,
             vendor: id.vendor(),
             product: id.product(),
-            buttons,
+            keys,
             axes,
             device,
         });
@@ -248,22 +307,24 @@ pub fn pick_pad(pads: Vec<PadCandidate>) -> Option<PadCandidate> {
     pads.into_iter().max_by_key(|p| p.score())
 }
 
+/// Detecta el mando preferido y devuelve su descripción clonable.
+pub fn detect_pad_info() -> Option<PadInfo> {
+    pick_pad(find_pads()).map(|pad| pad.info())
+}
+
 /// Abre directamente un nodo `/dev/input/eventXX`.
 pub fn open_pad(path: &Path) -> io::Result<PadCandidate> {
     let device = Device::open(path)?;
     let id = device.input_id();
     let name = device.name().unwrap_or("desconocido").to_string();
-    let buttons = device
-        .supported_keys()
-        .map(|keys| keys.iter().count())
-        .unwrap_or(0);
+    let keys = supported_keys(&device);
     let axes = device.get_absinfo()?.collect();
     Ok(PadCandidate {
         path: path.to_path_buf(),
         name,
         vendor: id.vendor(),
         product: id.product(),
-        buttons,
+        keys,
         axes,
         device,
     })
@@ -278,7 +339,7 @@ pub fn describe(pad: &PadCandidate) -> String {
         pad.name,
         pad.vendor,
         pad.product,
-        pad.buttons
+        pad.keys.len()
     ));
     for (code, ai) in &pad.axes {
         out.push_str(&format!(
@@ -660,6 +721,14 @@ impl Remapper {
         }
     }
 
+    /// Sustituye el perfil en caliente. Solo es seguro si los dispositivos
+    /// virtuales ya declaran los códigos del perfil nuevo: compara antes
+    /// [`Profile::caps_signature`].
+    pub fn set_tuning(&mut self, profile: Profile) {
+        self.binds = profile.bind_map();
+        self.profile = profile;
+    }
+
     fn mouse_mode_active(&self) -> bool {
         let cfg = &self.profile.stick_to_mouse;
         cfg.enabled && (cfg.hold.is_none() || self.hold_active)
@@ -885,6 +954,27 @@ impl Bridge {
             outputs,
             remapper,
         })
+    }
+
+    /// Lectura del físico, para bucles externos como el de la GUI.
+    pub fn fetch(&mut self, out: &mut Vec<InputEvent>) -> io::Result<Fetch> {
+        self.physical.fetch(out)
+    }
+
+    /// Traduce un evento del físico y lo emite en los dispositivos virtuales.
+    pub fn handle(&mut self, ev: &InputEvent) -> io::Result<Outcome> {
+        self.remapper.handle(ev, &mut self.outputs)
+    }
+
+    /// Paso periódico del modo stick-a-ratón.
+    pub fn tick(&mut self) -> io::Result<bool> {
+        self.remapper.tick(&mut self.outputs)
+    }
+
+    /// Aplica un perfil nuevo sin recrear los dispositivos virtuales. Solo es
+    /// válido si [`Profile::caps_signature`] no cambia.
+    pub fn set_tuning(&mut self, profile: Profile) {
+        self.remapper.set_tuning(profile);
     }
 
     pub fn run(&mut self, opts: RunOptions) -> io::Result<Stats> {

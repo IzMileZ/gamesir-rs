@@ -3,16 +3,26 @@
 Gestor/remapeador en Rust para el mando cableado **GameSir Tegenaria Lite**
 (VID:PID `3537:1093`) en CachyOS/Arch Linux.
 
-**Estado: fase 1 — motor de entrada.** La GUI (`eframe`/`egui`), el modo
-segundo plano (bandeja o `--daemon`) y la gestión de múltiples perfiles vienen
-en fases posteriores.
+**Estado: fase 2A — GUI nativa con `eframe`/`egui`.** Quedan pendientes el modo
+segundo plano (bandeja o `--daemon`) y el sondeo con epoll (fase 2B).
 
 ## Qué hace hoy
 
+- **Interfaz gráfica nativa** (`eframe`/`egui`, sin dependencias de GTK/Qt):
+  barra superior con estado de conexión, selector de perfil y botón de
+  Activar/Detener puente; pestaña de monitor en vivo; pestaña de remapeo y
+  ajustes. El puente corre en su propio hilo y nunca bloquea el pintado.
 - **Detección automática** del Tegenaria Lite entre todos los nodos de
   `/dev/input`. El mando expone tres nodos con el mismo nombre (gamepad,
   teclado y ratón); se elige el que tiene teclas de gamepad + ejes `ABS_X`/
-  `ABS_Y`, y se puntúa por VID/PID y nombre.
+  `ABS_Y`, y se puntúa por VID/PID y nombre. Si se desconecta y se vuelve a
+  conectar, el monitor lo retoma solo.
+- **Monitor en vivo** de botones (con su código real, para identificar `BTN_C`
+  y `BTN_Z`), sticks, gatillos y cruceta, más un registro de pulsaciones.
+- **Editor visual de binds** (botón físico → mando/teclado/ratón/ignorar) y
+  deslizadores de zona muerta, sensibilidad, umbral de hair trigger y
+  stick-a-ratón. Los ajustes numéricos se aplican en caliente; los cambios que
+  exigen declarar dispositivos virtuales nuevos reinician el puente solos.
 - **Vista en vivo** de botones y ejes tal cual llegan del hardware (`--watch`).
 - **Puente de entrada**: `grab()` exclusivo del mando físico (los juegos dejan
   de verlo) + dispositivos virtuales uinput.
@@ -34,7 +44,7 @@ botón que usen los binds (por ejemplo `BTN_C`).
 ## Requisitos y permisos
 
 - Rust (probado con 1.100.0 en CachyOS). Dependencias: `evdev` (con la feature
-  `serde`), `serde` + `derive`, `toml`.
+  `serde`), `serde` + `derive`, `toml` y `eframe` (`egui`).
 - **No hace falta root** si tu usuario pertenece al grupo `input` y
   `/dev/uinput` tiene la ACL `uaccess` de systemd-logind (caso habitual en un
   escritorio Arch):
@@ -55,16 +65,17 @@ botón que usen los binds (por ejemplo `BTN_C`).
 ## Uso
 
 ```bash
+cargo run --release                          # abre la interfaz gráfica
+cargo run --release -- --bridge              # puente en la terminal, sin GUI
 cargo run --release -- --list                # gamepads detectados y capacidades
 cargo run --release -- --watch               # vista en vivo de botones y ejes
-cargo run --release                          # puente con el perfil embebido
-cargo run --release -- --profile mi.toml     # puente con un perfil concreto
+cargo run --release -- --profile mi.toml     # perfil concreto (también en la GUI)
 cargo run --release -- --write-default-profile ~/.config/gamesir-rs/prueba.toml
 ```
 
 | Opción | Efecto |
 | --- | --- |
-| `-b`, `--bridge` | puente sin GUI (es el modo por defecto) |
+| `-b`, `--bridge` | puente en la terminal en vez de abrir la GUI |
 | `-d`, `--device RUTA` | usar un nodo `/dev/input/eventXX` concreto |
 | `-t`, `--duration SEG` | cerrar el puente tras SEG segundos |
 | `-n`, `--no-grab` | no capturar el físico en exclusivo (para probar en paralelo) |
@@ -73,11 +84,39 @@ cargo run --release -- --write-default-profile ~/.config/gamesir-rs/prueba.toml
 
 Ctrl+C termina el puente: el kernel cierra los descriptores al morir el
 proceso, así que el `grab()` y los dispositivos virtuales se liberan solos
-(comprobado). En salidas normales también lo garantizan los `Drop`.
+(comprobado). Al cerrar la ventana de la GUI ocurre lo mismo: el `Drop` de la
+aplicación apaga el hilo de trabajo y este suelta el mando.
 
 > Ojo si lo lanzas en segundo plano desde un script no interactivo
 > (`gamesir-rs &`): bash marca esos procesos con SIGINT/SIGQUIT ignorados, así
 > que Ctrl+C no los parará. Usa `--duration` o `kill -TERM`.
+
+## Interfaz gráfica
+
+- **Barra superior**: punto de estado con el nombre y la ruta del nodo
+  detectado (o «no detectado»), VID:PID y modo actual; selector de perfil con
+  los TOML de `~/.config/gamesir-rs/profiles/` más el embebido; botones
+  Guardar / Guardar como… / Nuevo; y el botón grande **▶ Activar puente** /
+  **■ Detener puente** (deshabilitado si no hay mando).
+- **Pestaña «Monitor en vivo»**: rejilla de chips con todos los botones que
+  declara el mando —se encienden en verde al pulsarlos, con su código real—,
+  barras de los dos sticks y de los gatillos (valor normalizado y valor crudo),
+  cruceta y registro de las últimas pulsaciones.
+- **Pestaña «Remapeo y ajustes»**: una fila por botón físico con selector de
+  acción (Automático / Botón de mando / Tecla / Clic de ratón / Ignorar),
+  selector de destino y botón para quitar el bind; debajo, los deslizadores de
+  zona muerta y sensibilidad por stick, el hair trigger con su umbral y el
+  bloque de stick-a-ratón (stick, velocidad, supresión del eje y botón de
+  retención).
+- **Barra inferior**: nodos virtuales creados, contadores de eventos y el
+  último aviso o error.
+
+Los perfiles que guarda la GUI van a `~/.config/gamesir-rs/profiles/`
+(`$XDG_CONFIG_HOME` si está definido). Los cambios de sliders y checkboxes se
+aplican al puente en caliente; si un cambio exige declarar códigos o
+dispositivos virtuales nuevos (editar binds o activar stick-a-ratón), el hilo
+reinicia el puente tras 400 ms de calma para no recrear dispositivos en cada
+frame de un arrastre.
 
 ## Formato del perfil
 
@@ -138,7 +177,8 @@ como un mando Xbox-like con sticks de 16 bits.
 ## Estructura
 
 ```
-src/main.rs      CLI mínima: parseo de argumentos y modos (list/watch/puente)
+src/main.rs      CLI: parseo de argumentos y elección de modo (GUI/list/watch/puente)
+src/gui.rs       interfaz eframe/egui y el hilo de trabajo que habla con el mando
 src/input.rs     detección, grab(), dispositivos virtuales uinput, remapeo y bucle
 src/profile.rs   tipos del perfil, carga/guardado TOML y saneado de valores
 profiles/default.toml   perfil de prueba (embebido en el binario con include_str!)
@@ -148,10 +188,11 @@ tools/           bancos de pruebas con el hardware real (Python + python-evdev)
 
 ## Verificación
 
-- `cargo test` → 14 tests unitarios de la matemática de ejes (normalización,
-  zona muerta radial, saturación de sensibilidad, hair trigger, escalado) y del
+- `cargo test` → 15 tests unitarios de la matemática de ejes (normalización,
+  zona muerta radial, saturación de sensibilidad, hair trigger, escalado), del
   parseo de perfiles (defaults, recorte de valores, rechazo de claves y
-  nombres inválidos, ida y vuelta TOML).
+  nombres inválidos, ida y vuelta TOML) y de la firma de capacidades que
+  decide si un perfil puede aplicarse en caliente.
 - `cargo clippy --all-targets` sin avisos, `cargo fmt` aplicado.
 - **Prueba de extremo a extremo con el mando real** (inyectando eventos en el
   nodo físico, que al estar capturado en exclusivo solo ve el puente): binds a
@@ -164,6 +205,13 @@ tools/           bancos de pruebas con el hardware real (Python + python-evdev)
   virtual con `suppress_axis = true`.
 - **SIGINT**: retorno -2, nodos virtuales destruidos y el siguiente puente
   vuelve a capturar el físico sin `EBUSY`.
+- **GUI sobre el escritorio real** (Hyprland/Wayland, con capturas de pantalla
+  y clics simulados con `ydotool`): la ventana abre y pinta las dos pestañas;
+  con eventos inyectados en el nodo físico se encienden los chips de
+  `BTN_SOUTH`/`BTN_C`, se deflectan las barras de stick y gatillo y se rellena
+  el registro de pulsaciones; el botón **Activar puente** crea los tres
+  dispositivos virtuales y cambia el estado a «mando capturado»; al cerrar la
+  ventana el proceso termina y no queda ningún dispositivo virtual.
 
 Los tres bancos de pruebas de hardware viven en [`tools/`](tools/README.md); se
 repiten con `python tools/<script>.py` (necesitan `python-evdev` y el mando
@@ -173,10 +221,10 @@ Pendiente de identificar en el hardware: `BTN_C` y `BTN_Z` están declarados por
 el mando pero no se ha confirmado qué botones físicos son (probablemente los
 traseros).
 
-## Siguiente fase
+## Siguiente fase (2B)
 
-- GUI nativa ligera con `eframe`/`egui`: detector con vista en vivo, editor de
-  binds, deslizadores de deadzone/sensibilidad/umbral y gestión de perfiles.
-- Modo segundo plano (bandeja del sistema o `--daemon`).
-- Reconexión en caliente del mando y sondeo con epoll en vez del bucle actual
-  de lectura no bloqueante + espera de 1 ms.
+- Modo segundo plano: bandeja del sistema (`tray-icon`) y/o flag `--daemon`.
+- Reactivar el puente automáticamente al reconectar el mando (el monitor ya se
+  recupera solo; el puente no).
+- Sondeo con epoll en vez del bucle actual de lectura no bloqueante + espera
+  de 1 ms.

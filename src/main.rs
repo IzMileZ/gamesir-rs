@@ -1,6 +1,6 @@
-//! CLI mínima de la fase 1: detector, vista en vivo y puente de entrada.
-//! La GUI (eframe/egui) llega en una fase posterior.
+//! gamesir-rs: interfaz gráfica (por defecto) y CLI de diagnóstico/puente.
 
+mod gui;
 mod input;
 mod profile;
 
@@ -15,11 +15,11 @@ const USAGE: &str = "\
 gamesir-rs — puente de entrada para el GameSir Tegenaria Lite
 
 Uso:
-  gamesir-rs                       puente con el perfil embebido de prueba
-  gamesir-rs --bridge              ídem, explícito (modo por defecto)
+  gamesir-rs                       abre la interfaz gráfica
+  gamesir-rs --bridge              puente en la terminal, sin GUI
   gamesir-rs --list                lista los gamepads detectados y sale
   gamesir-rs --watch               vista en vivo de botones y ejes del físico
-  gamesir-rs --profile PERFIL.toml usa un perfil concreto
+  gamesir-rs --profile PERFIL.toml usa un perfil concreto (también en la GUI)
   gamesir-rs --write-default-profile RUTA
                                    vuelca el perfil embebido en TOML
 
@@ -111,11 +111,11 @@ fn print_stats(stats: &Stats) {
     }
 }
 
-/// Modo pedido en la línea de comandos. `--bridge` explicita el modo por
-/// defecto de la fase 1; cuando la GUI pase a ser el modo por defecto, este
-/// flag servirá para forzar el puente sin interfaz gráfica.
+/// Modo pedido en la línea de comandos. Sin flags se abre la GUI; `--bridge`
+/// fuerza el puente en la terminal (útil para los bancos de pruebas de tools/).
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
+    Gui,
     List,
     Watch,
     Bridge,
@@ -125,7 +125,8 @@ fn mode_of(args: &Args) -> Mode {
     match (args.list, args.watch, args.bridge) {
         (true, ..) => Mode::List,
         (_, true, _) => Mode::Watch,
-        _ => Mode::Bridge,
+        (_, _, true) => Mode::Bridge,
+        _ => Mode::Gui,
     }
 }
 
@@ -143,6 +144,10 @@ fn run(args: Args) -> Result<(), String> {
     };
 
     let mode = mode_of(&args);
+
+    if mode == Mode::Gui {
+        return gui::run(profile, args.profile_path.clone());
+    }
 
     if mode == Mode::List {
         let pads = input::find_pads();

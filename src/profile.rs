@@ -27,7 +27,7 @@ pub enum Action {
     Ignore,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bind {
     /// Código de botón del mando físico.
@@ -36,7 +36,7 @@ pub struct Bind {
 }
 
 /// Zona muerta y sensibilidad de un stick Hall Effect.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StickConfig {
     /// Zona muerta radial, 0.0 (ninguna) .. 0.95.
@@ -69,7 +69,7 @@ impl StickConfig {
 }
 
 /// Umbral rápido (hair trigger) de los gatillos L2/R2.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TriggerConfig {
     /// Con `true`, el recorrido útil empieza en `threshold` y llega a tope antes.
@@ -105,7 +105,7 @@ pub enum Stick {
 }
 
 /// Convierte la deflexión de un stick en movimiento del ratón virtual.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StickToMouse {
     pub enabled: bool,
@@ -140,7 +140,7 @@ impl StickToMouse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
     pub name: String,
@@ -225,14 +225,11 @@ impl Profile {
         Self::parse(&std::fs::read_to_string(path)?)
     }
 
-    // Los usará la GUI de la fase 2 para el guardado de perfiles.
-    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<(), ProfileError> {
         std::fs::write(path, self.to_toml()?)?;
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn to_toml(&self) -> Result<String, ProfileError> {
         Ok(toml::to_string_pretty(self)?)
     }
@@ -250,6 +247,16 @@ impl Profile {
     /// repite, gana la última entrada del perfil.
     pub fn bind_map(&self) -> HashMap<u16, Action> {
         self.binds.iter().map(|b| (b.from.0, b.to)).collect()
+    }
+
+    /// Firma de lo que obliga a **recrear** los dispositivos virtuales: qué
+    /// códigos hay que declarar y si hace falta el ratón virtual. Si no cambia,
+    /// el perfil puede aplicarse en caliente con
+    /// [`Remapper::set_tuning`](crate::input::Remapper::set_tuning).
+    pub fn caps_signature(&self) -> (Vec<(u16, Action)>, bool) {
+        let mut binds: Vec<(u16, Action)> = self.bind_map().into_iter().collect();
+        binds.sort_by_key(|(code, _)| *code);
+        (binds, self.stick_to_mouse.enabled)
     }
 }
 
@@ -321,5 +328,25 @@ mod tests {
         assert_eq!(again.bind_map(), p.bind_map());
         assert_eq!(again.name, p.name);
         assert_eq!(again.triggers.threshold, p.triggers.threshold);
+    }
+
+    #[test]
+    fn caps_signature_only_changes_with_the_virtual_devices() {
+        let a = Profile::parse("[[bind]]\nfrom = \"BTN_C\"\nto = { key = \"KEY_A\" }\n").unwrap();
+        let b = Profile::parse("[[bind]]\nfrom = \"BTN_C\"\nto = { pad = \"BTN_C\" }\n").unwrap();
+        assert_ne!(
+            a.caps_signature().0,
+            b.caps_signature().0,
+            "cambiar el destino de un bind obliga a recrear los virtuales"
+        );
+
+        // Ajustes puramente numéricos: aplicables en caliente.
+        let c = Profile::parse("[left_stick]\ndeadzone = 0.3\n").unwrap();
+        let d = Profile::parse("[left_stick]\ndeadzone = 0.1\n").unwrap();
+        assert_eq!(c.caps_signature(), d.caps_signature());
+
+        // Activar stick-a-ratón hace falta el ratón virtual.
+        let e = Profile::parse("[stick_to_mouse]\nenabled = true\n").unwrap();
+        assert_ne!(c.caps_signature(), e.caps_signature());
     }
 }
